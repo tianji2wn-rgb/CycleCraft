@@ -1,0 +1,10 @@
+[project]
+name = "cyclecraft"
+version = "0.1.0"
+description = "自动化设备动作时序图计算软件核心引擎"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "networkx>=3.0",
+    "nicegui>=1.4.0",
+]
