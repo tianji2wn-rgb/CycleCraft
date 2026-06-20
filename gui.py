@@ -290,7 +290,14 @@ def refresh_ui():
             py = node_row[pred_id]
             sy = node_row[succ_id]
             px = node_times[pred_id]["end"]
-            sx = node_times[succ_id]["start"]
+            
+            # 获取后置节点的延迟时间，使连线终点指向延迟框的起点，从根本上避免穿透延迟框
+            succ_delay = 0.0
+            for dep in calculator.dependencies:
+                if dep.successor_id == succ_id:
+                    succ_delay = dep.delay
+                    break
+            sx = node_times[succ_id]["start"] - succ_delay
             
             if py == sy:
                 # 同一行直接水平直线连接
@@ -303,27 +310,76 @@ def refresh_ui():
                     }
                 ]
             else:
-                # 跨行：采用「二段式贝塞尔插值模型」强制让连线大跨度向右水平跨出、在通道空隙垂直穿过、最后水平从左端滑入，从根本上避开与矩形短边（px、sx 竖线）的重合。
-                dx = 30  # 绕行裕量（单位: ms，即在 X 轴上水平移开 30ms 宽度的物理像素）
-                my = (py + sy) / 2.0
-                bezier_pts = []
+                # 跨行：避开连线本身连接的两个矩形内部及短边边缘
+                dx = 15  # 安全偏置量
                 
-                # 【第一阶段】从起点 [px, py] 弧形跨越到中点 [px + dx, my]
-                # 控制点为：[px, py] ➔ [px + dx, py] ➔ [px + dx, my]
-                for step in range(10):
-                    t = step / 10.0
-                    bx = (1-t)**2 * px + 2*(1-t)*t * (px + dx) + t**2 * (px + dx)
-                    by = (1-t)**2 * py + 2*(1-t)*t * py + t**2 * my
-                    bezier_pts.append([bx, by])
-                
-                # 【第二阶段】从中点 [px + dx, my] 弧形过渡到终点 [sx, sy]
-                # 为了实现从左侧水平滑入，控制点为：[px + dx, my] ➔ [sx - dx, my] ➔ [sx - dx, sy] ➔ [sx, sy]
-                for step in range(11):
-                    t = step / 10.0
-                    bx = (1-t)**3 * (px + dx) + 3*(1-t)**2 * t * (sx - dx) + 3*(1-t) * t**2 * (sx - dx) + t**3 * sx
-                    by = (1-t)**3 * my + 3*(1-t)**2 * t * my + 3*(1-t) * t**2 * sy + t**3 * sy
-                    bezier_pts.append([bx, by])
-                
+                # 如果 X 轴上连接间隔足够，则采用更简约的单垂直段
+                if sx - px >= 2.0 * dx:
+                    # 1. 采用单个垂直段（2个圆角过渡）
+                    candidate_x = (px + sx) / 2.0
+                    my = (py + sy) / 2.0
+                    bezier_pts = []
+                    # Corner 1: 从 [px, py] -> [candidate_x, py] -> [candidate_x, my]
+                    for step in range(10):
+                        t = step / 9.0
+                        bx = (1-t)**2 * px + 2*(1-t)*t * candidate_x + t**2 * candidate_x
+                        by = (1-t)**2 * py + 2*(1-t)*t * py + t**2 * my
+                        bezier_pts.append([bx, by])
+                    # Corner 2: 从 [candidate_x, my] -> [candidate_x, sy] -> [sx, sy]
+                    for step in range(1, 11):
+                        t = step / 10.0
+                        bx = (1-t)**2 * candidate_x + 2*(1-t)*t * candidate_x + t**2 * sx
+                        by = (1-t)**2 * my + 2*(1-t)*t * sy + t**2 * sy
+                        bezier_pts.append([bx, by])
+                else:
+                    # 2. 采用双垂直段绕行（3段水平，2段垂直，4个圆角过渡）
+                    # 此时 X1 = px + dx (向右绕过前置矩形), X2 = sx - dx (从左侧滑入后置矩形)
+                    if sy > py:
+                        my = (py + sy) // 2 + 0.5
+                    else:
+                        my = -((-py - sy) // 2) - 0.5
+                        
+                    X1 = px + dx
+                    X2 = sx - dx
+                    
+                    # 兜底确保 X 坐标合理
+                    X1 = max(10.0, X1)
+                    X2 = max(10.0, X2)
+                    
+                    my1 = (py + my) / 2.0
+                    mx = (X1 + X2) / 2.0
+                    my2 = (my + sy) / 2.0
+                    
+                    bezier_pts = []
+                    
+                    # Corner 1: [px, py] -> [X1, py] -> [X1, my1]
+                    for step in range(6):
+                        t = step / 5.0
+                        bx = (1-t)**2 * px + 2*(1-t)*t * X1 + t**2 * X1
+                        by = (1-t)**2 * py + 2*(1-t)*t * py + t**2 * my1
+                        bezier_pts.append([bx, by])
+                        
+                    # Corner 2: [X1, my1] -> [X1, my] -> [mx, my]
+                    for step in range(1, 6):
+                        t = step / 5.0
+                        bx = (1-t)**2 * X1 + 2*(1-t)*t * X1 + t**2 * mx
+                        by = (1-t)**2 * my1 + 2*(1-t)*t * my + t**2 * my
+                        bezier_pts.append([bx, by])
+                        
+                    # Corner 3: [mx, my] -> [X2, my] -> [X2, my2]
+                    for step in range(1, 6):
+                        t = step / 5.0
+                        bx = (1-t)**2 * mx + 2*(1-t)*t * X2 + t**2 * X2
+                        by = (1-t)**2 * my + 2*(1-t)*t * my + t**2 * my2
+                        bezier_pts.append([bx, by])
+                        
+                    # Corner 4: [X2, my2] -> [X2, sy] -> [sx, sy]
+                    for step in range(1, 6):
+                        t = step / 5.0
+                        bx = (1-t)**2 * X2 + 2*(1-t)*t * X2 + t**2 * sx
+                        by = (1-t)**2 * my2 + 2*(1-t)*t * sy + t**2 * sy
+                        bezier_pts.append([bx, by])
+                        
                 # 终点配置为箭头
                 bezier_pts[-1] = {
                     'value': [sx, sy],
@@ -349,6 +405,7 @@ def refresh_ui():
                 'tooltip': {'show': False},
                 'z': 10
             })
+
 
         chart.options['yAxis']['data'] = categories
         chart.options['series'] = [
