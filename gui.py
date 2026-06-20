@@ -303,23 +303,33 @@ def refresh_ui():
                     }
                 ]
             else:
-                # 跨行：通过 Python 预先精确计算 20 点三次贝塞尔曲线，形成真正平滑的手绘感圆角 S 形线
-                dx = 30  # 稍微增大水平避让宽度，使弯曲更舒展
+                # 跨行：采用「二段式贝塞尔插值模型」强制让连线大跨度向右水平跨出、在通道空隙垂直穿过、最后水平从左端滑入，从根本上避开与矩形短边（px、sx 竖线）的重合。
+                dx = 30  # 绕行裕量（单位: ms，即在 X 轴上水平移开 30ms 宽度的物理像素）
+                my = (py + sy) / 2.0
                 bezier_pts = []
-                for step in range(20):
-                    t = step / 20.0
-                    # 三次贝塞尔曲线公式: B(t) = (1-t)^3 * P0 + 3*(1-t)^2*t * P1 + 3*(1-t)*t^2 * P2 + t^3 * P3
-                    # P0 = [px, py], P1 = [px + dx, py], P2 = [sx - dx, sy], P3 = [sx, sy]
-                    bx = (1-t)**3 * px + 3*(1-t)**2 * t * (px + dx) + 3*(1-t) * t**2 * (sx - dx) + t**3 * sx
-                    by = (1-t)**3 * py + 3*(1-t)**2 * t * py + 3*(1-t) * t**2 * sy + t**3 * sy
+                
+                # 【第一阶段】从起点 [px, py] 弧形跨越到中点 [px + dx, my]
+                # 控制点为：[px, py] ➔ [px + dx, py] ➔ [px + dx, my]
+                for step in range(10):
+                    t = step / 10.0
+                    bx = (1-t)**2 * px + 2*(1-t)*t * (px + dx) + t**2 * (px + dx)
+                    by = (1-t)**2 * py + 2*(1-t)*t * py + t**2 * my
                     bezier_pts.append([bx, by])
                 
-                # 终点添加特殊 Arrow 样式，前面所有插值点均不配置 symbol 属性，从根本上杜绝绿色节点渲染
-                bezier_pts.append({
+                # 【第二阶段】从中点 [px + dx, my] 弧形过渡到终点 [sx, sy]
+                # 为了实现从左侧水平滑入，控制点为：[px + dx, my] ➔ [sx - dx, my] ➔ [sx - dx, sy] ➔ [sx, sy]
+                for step in range(11):
+                    t = step / 10.0
+                    bx = (1-t)**3 * (px + dx) + 3*(1-t)**2 * t * (sx - dx) + 3*(1-t) * t**2 * (sx - dx) + t**3 * sx
+                    by = (1-t)**3 * my + 3*(1-t)**2 * t * my + 3*(1-t) * t**2 * sy + t**3 * sy
+                    bezier_pts.append([bx, by])
+                
+                # 终点配置为箭头
+                bezier_pts[-1] = {
                     'value': [sx, sy],
                     'symbol': 'arrow',
                     'symbolSize': 8
-                })
+                }
                 path_data = bezier_pts
                 
             bottleneck_series_list.append({
