@@ -294,30 +294,44 @@ def refresh_ui():
             
             if py == sy:
                 # 同一行直接水平直线连接
-                path_data = [[px, py], [sx, sy]]
-                smooth_val = 0
-            else:
-                # 跨行：横平竖直圆角 S 形弯曲折线
-                mid_x = (px + sx) / 2
                 path_data = [
                     [px, py],
-                    [mid_x, py],
-                    [mid_x, sy],
-                    [sx, sy]
+                    {
+                        'value': [sx, sy],
+                        'symbol': 'arrow',
+                        'symbolSize': 8
+                    }
                 ]
-                # smooth 设为 0.18，让拐角圆滑过渡，形成精美的 S 形拐弯
-                smooth_val = 0.18
+            else:
+                # 跨行：通过 Python 预先精确计算 20 点三次贝塞尔曲线，形成真正平滑的手绘感圆角 S 形线
+                dx = 30  # 稍微增大水平避让宽度，使弯曲更舒展
+                bezier_pts = []
+                for step in range(20):
+                    t = step / 20.0
+                    # 三次贝塞尔曲线公式: B(t) = (1-t)^3 * P0 + 3*(1-t)^2*t * P1 + 3*(1-t)*t^2 * P2 + t^3 * P3
+                    # P0 = [px, py], P1 = [px + dx, py], P2 = [sx - dx, sy], P3 = [sx, sy]
+                    bx = (1-t)**3 * px + 3*(1-t)**2 * t * (px + dx) + 3*(1-t) * t**2 * (sx - dx) + t**3 * sx
+                    by = (1-t)**3 * py + 3*(1-t)**2 * t * py + 3*(1-t) * t**2 * sy + t**3 * sy
+                    bezier_pts.append([bx, by])
+                
+                # 终点添加特殊 Arrow 样式，前面所有插值点均不配置 symbol 属性，从根本上杜绝绿色节点渲染
+                bezier_pts.append({
+                    'value': [sx, sy],
+                    'symbol': 'arrow',
+                    'symbolSize': 8
+                })
+                path_data = bezier_pts
                 
             bottleneck_series_list.append({
                 'name': '瓶颈工序链连线',
                 'type': 'line',
                 'data': path_data,
-                'smooth': smooth_val,
-                'symbol': ['none', 'arrow'],
-                'symbolSize': 8,
+                'smooth': False,             # 已在 Python 端实现精确平滑，ECharts 无需二次平滑
+                'symbol': 'none',            # 默认全局不显示标记点（隐藏所有绿色方块）
+                'symbolSize': 0,
                 'lineStyle': {
                     'color': '#ef4444',
-                    'width': 2,
+                    'width': 2.2,
                     'type': 'solid'
                 },
                 'label': {'show': False},
