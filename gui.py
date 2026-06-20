@@ -279,10 +279,103 @@ def refresh_ui():
                 }
             })
             
+        # 计算瓶颈工序链（关键路径）的拐角圆角 S 形连接折线
+        bottleneck_series_list = []
+        node_row = {node.id: i for i, node in enumerate(sorted_nodes)}
+        for i in range(len(path) - 1):
+            pred_id = path[i]
+            succ_id = path[i+1]
+            if pred_id not in node_row or succ_id not in node_row:
+                continue
+            py = node_row[pred_id]
+            sy = node_row[succ_id]
+            px = node_times[pred_id]["end"]
+            sx = node_times[succ_id]["start"]
+            
+            if py == sy:
+                # 同一行直接水平直线连接
+                path_data = [[px, py], [sx, sy]]
+                smooth_val = 0
+            else:
+                # 跨行：横平竖直圆角 S 形弯曲折线
+                mid_x = (px + sx) / 2
+                path_data = [
+                    [px, py],
+                    [mid_x, py],
+                    [mid_x, sy],
+                    [sx, sy]
+                ]
+                # smooth 设为 0.18，让拐角圆滑过渡，形成精美的 S 形拐弯
+                smooth_val = 0.18
+                
+            bottleneck_series_list.append({
+                'name': '瓶颈工序链连线',
+                'type': 'line',
+                'data': path_data,
+                'smooth': smooth_val,
+                'symbol': ['none', 'arrow'],
+                'symbolSize': 8,
+                'lineStyle': {
+                    'color': '#ef4444',
+                    'width': 2,
+                    'type': 'solid'
+                },
+                'label': {'show': False},
+                'emphasis': {'disabled': True},
+                'tooltip': {'show': False},
+                'z': 10
+            })
+
         chart.options['yAxis']['data'] = categories
-        chart.options['series'][0]['data'] = offset_data
-        chart.options['series'][1]['data'] = delay_data
-        chart.options['series'][2]['data'] = duration_data
+        chart.options['series'] = [
+            {
+                'name': '开始时间',
+                'type': 'bar',
+                'stack': 'Total',
+                'itemStyle': {
+                    'borderColor': 'rgba(0,0,0,0)',
+                    'color': 'rgba(0,0,0,0)'
+                },
+                'emphasis': {
+                    'itemStyle': {
+                        'borderColor': 'rgba(0,0,0,0)',
+                        'color': 'rgba(0,0,0,0)'
+                    }
+                },
+                'data': offset_data
+            },
+            {
+                'name': '延迟时间',
+                'type': 'bar',
+                'stack': 'Total',
+                'itemStyle': {
+                    'color': 'rgba(244, 63, 94, 0.08)',
+                    'borderColor': '#f43f5e',
+                    'borderWidth': 1.5,
+                    'borderType': 'dashed',
+                    'borderRadius': 4
+                },
+                'label': {
+                    'show': True,
+                    'position': 'inside',
+                    'formatter': '{c} ms',
+                    'fontSize': 9,
+                    'color': '#e11d48'
+                },
+                'data': delay_data
+            },
+            {
+                'name': '动作耗时',
+                'type': 'bar',
+                'stack': 'Total',
+                'label': {
+                    'show': True,
+                    'position': 'insideRight',
+                    'formatter': '{c} ms'
+                },
+                'data': duration_data
+            }
+        ] + bottleneck_series_list
         chart.update()
 
         # C. 更新节点关系图 (水平泳道 + 横平竖直连线)
