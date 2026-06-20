@@ -231,23 +231,41 @@ def refresh_ui():
         # B. 更新 ECharts 时序甘特图 (游泳道/分组/高亮)
         node_times = results["node_times"]
         
-        # 按工位（station）排序实现分组，并在同工位内按绝对开始时间升序排列，形成平滑的泳道效果
+        # 按照节点 ID 顺序排序（从上到下由小到大）
         sorted_nodes = sorted(
             calculator.nodes.values(),
-            key=lambda n: (n.station, node_times[n.id]["start"])
+            key=lambda n: int(n.id) if n.id.isdigit() else n.id
         )
         
         categories = []
         row_action_ids = []
         offset_data = []    # 系列 1 数据 (透明辅助柱)
-        duration_data = []  # 系列 2 数据 (实际耗时柱)
+        delay_data = []     # 系列 2 数据 (延迟时间辅助柱)
+        duration_data = []  # 系列 3 数据 (实际耗时柱)
         
         for node in sorted_nodes:
             categories.append(f"{node.station}\n{node.name} (ID: {node.id})")
             row_action_ids.append(node.id)
             
-            # 开始时间即透明辅助柱的宽度值
-            offset_data.append(node_times[node.id]["start"])
+            # 查找此节点前置关系中的延迟时间
+            delay_time = 0.0
+            for dep in calculator.dependencies:
+                if dep.successor_id == node.id:
+                    delay_time = dep.delay
+                    break
+                    
+            start_time = node_times[node.id]["start"]
+            
+            # 开始时间减去延迟，就是透明辅助柱的宽度值
+            offset_w = max(0.0, start_time - delay_time)
+            offset_data.append(offset_w)
+            
+            # 实际延迟大小（若有）
+            actual_delay = min(start_time, delay_time)
+            if actual_delay > 0:
+                delay_data.append(actual_delay)
+            else:
+                delay_data.append(None) # 使用 None 占位，ECharts 不会展示 0 ms 的标签
             
             # 分色：属于关键路径 (瓶颈工序) 的渲染为醒目的红褐色，普通渲染为浅蓝色
             is_critical = node.id in path
@@ -263,7 +281,8 @@ def refresh_ui():
             
         chart.options['yAxis']['data'] = categories
         chart.options['series'][0]['data'] = offset_data
-        chart.options['series'][1]['data'] = duration_data
+        chart.options['series'][1]['data'] = delay_data
+        chart.options['series'][2]['data'] = duration_data
         chart.update()
 
         # C. 更新节点关系图 (水平泳道 + 横平竖直连线)
@@ -284,196 +303,264 @@ def refresh_ui():
                     depth[dep.successor_id] = new_d
                     changed = True
 
-        # 工位 -> Y 行
-        stations = sorted({n.station for n in calculator.nodes.values()})
-        station_row = {s: i for i, s in enumerate(stations)}
-        num_stations = len(stations)
-
-        # 统一使用数据坐标，graphic 元素通过 convertToPixel 转换为像素坐标
-        # （ECharts graphic 用像素坐标，series 用数据坐标，必须区分处理）
-        max_d = max(depth.values()) if depth else 0
-        data_w = 900   # 数据坐标系宽度
-        row_h = 80     # 数据坐标系中每行高度
-        data_h = max(200, num_stations * row_h + 40)
-        x_gap = (data_w - 120) / max(max_d, 1)
-
-        # 节点尺寸（数据坐标系下的宽高）
-        node_w_data = 120
-        node_h_data = 35
-
-        # 节点坐标（数据坐标系，每个工位一行，垂直居中）
-        # 同工位同深度的节点需要错开，避免重叠
-        pos = {}
+        # 为了解决同深度同工位节点重叠问题，我们需要动态计算每个工位的行高
         layers = {}
         for nid, d in depth.items():
             layers.setdefault(d, []).append(nid)
+            
+        stations = sorted({n.station for n in calculator.nodes.values()})
+        
+        # 统计每个工位在同一深度的最大并发节点数
+        station_max_concurrent = {s: 1 for s in stations}
         for d, nids in layers.items():
-            # 按工位分组，同工位同深度的节点垂直错开
-            station_counts = Counter(calculator.nodes[nid].station for nid in nids)
-            station_idx = {}  # 记录每个工位当前已放置的节点数
-            for nid in nids:
-                station = calculator.nodes[nid].station
-                row = station_row.get(station, 0)
-                group_size = station_counts[station]
-                idx = station_idx.get(station, 0)
-                station_idx[station] = idx + 1
-                x = 60 + d * x_gap
-                # 同组内垂直居中排列
-                y_base = 20 + row * row_h + row_h / 2
-                if group_size > 1:
-                    y = y_base + (idx - (group_size - 1) / 2) * (node_h_data + 8)
-                else:
-                    y = y_base
-                pos[nid] = (x, y)
-
-        # 设置动态轴范围（数据坐标系）
-        all_x = [p[0] for p in pos.values()]
-        all_y = [p[1] for p in pos.values()]
-        x_min = min(all_x) - 80 if all_x else 0
-        x_max = max(all_x) + 80 if all_x else data_w
+            counts = Counter(calculator.nodes[nid].station for nid in nids)
+            for s, c in counts.items():
+                station_max_concurrent[s] = max(station_max_concurrent[s], c)
+                
+        # 动态计算每个工位的 Y 坐标范围与总高度
+        station_y_min = {}
+        station_y_max = {}
+        current_y = 0
+        node_h_spacing = 85  # 节点垂直间距，增高以提供更多垂直空隙
+        
+        for s in stations:
+            station_y_min[s] = current_y
+            # 泳道最小高度调大，确保即使没有并发也能有足够高度放置图标和节点
+            req_h = max(110, station_max_concurrent[s] * node_h_spacing + 50)
+            current_y += req_h
+            station_y_max[s] = current_y
+            
+        max_d = max(depth.values()) if depth else 0
+        x_gap = 210  # 增大横向间距，放置更宽的连线文本
+        x_min = 0
+        # 增加右边距，并配合起始偏移调大总宽度，容纳深度较大的节点
+        x_max = max(1100, max_d * x_gap + 450)
         y_min = 0
-        y_max = max(data_h, max(all_y) + 60) if all_y else data_h
+        y_max = current_y
 
-        # 像素坐标转换函数（graphic 元素专用）
+        # 动态计算图表容器宽高以适应节点数量，并更新图表样式（以支持 scroll_area 滚动）
+        chart_w = max(1100, max_d * x_gap + 450)
+        chart_h = max(380, len(stations) * 120 + 80)
+        graph_chart.style(f'width: {chart_w}px; height: {chart_h}px;')
+
         grid_left = 40
         grid_right = 40
         grid_top = 20
         grid_bottom = 30
-        chart_w = 760   # echart 容器近似像素宽度
-        chart_h = 384   # h-96 = 384px
+        
+        # 计算像素与数据坐标转换比例，以便在数据坐标中实现精确的像素级偏移（如连接线刚好触及节点边缘）
+        grid_w_px = chart_w - grid_left - grid_right
+        grid_h_px = chart_h - grid_top - grid_bottom
+        
+        node_w_data = 110 * (x_max - x_min) / grid_w_px if grid_w_px > 0 else 0
+        node_h_data = 42 * (y_max - y_min) / grid_h_px if grid_h_px > 0 else 0
 
-        def to_px_x(dx):
-            return grid_left + (dx - x_min) / (x_max - x_min) * (chart_w - grid_left - grid_right)
+        pos = {}
+        for d, nids in layers.items():
+            # 按工位分组，同工位同深度的节点垂直错开
+            station_counts = Counter(calculator.nodes[nid].station for nid in nids)
+            station_idx = {}
+            for nid in nids:
+                station = calculator.nodes[nid].station
+                group_size = station_counts[station]
+                idx = station_idx.get(station, 0)
+                station_idx[station] = idx + 1
+                
+                # 起始坐标增加到 220，为左侧泳道名称 label 🏭 工位名称 留出绝对充足的像素空间
+                x = 220 + d * x_gap
+                y_center = (station_y_min[station] + station_y_max[station]) / 2
+                
+                # 垂直居中分布
+                y = y_center + (idx - (group_size - 1) / 2) * node_h_spacing
+                pos[nid] = (x, y)
 
-        def to_px_y(dy):
-            return grid_top + (1 - (dy - y_min) / (y_max - y_min)) * (chart_h - grid_top - grid_bottom)
-
-        # 泳道背景色（交替颜色）
         lane_colors = ['#f0f9ff', '#f0fdf4', '#fefce8', '#fdf2f8', '#f5f3ff', '#ecfdf5']
-        graphic_elements = []
+        mark_area_data = []
         for i, station in enumerate(stations):
             color = lane_colors[i % len(lane_colors)]
-            y_top_px = to_px_y(20 + (i + 1) * row_h)   # 泳道底部（数据坐标向上递增，像素向下递增）
-            y_bot_px = to_px_y(20 + i * row_h)           # 泳道顶部
-            # 泳道背景矩形（graphic 用像素坐标）
-            graphic_elements.append({
-                'type': 'rect',
-                'left': grid_left,
-                'top': y_top_px,
-                'shape': {'width': chart_w - grid_left - grid_right, 'height': y_bot_px - y_top_px},
-                'style': {'fill': color, 'opacity': 0.6},
-                'z': 0
-            })
-            # 工位名称标签
-            graphic_elements.append({
-                'type': 'text',
-                'left': 8,
-                'top': (y_top_px + y_bot_px) / 2,
-                'style': {
-                    'text': f'🏭 {station}',
-                    'fill': '#475569',
-                    'fontSize': 12,
-                    'fontWeight': 'bold',
-                    'textAlign': 'left',
-                    'textVerticalAlign': 'middle'
+            mark_area_data.append([
+                {
+                    'yAxis': station_y_min[station],
+                    'itemStyle': {'color': color, 'opacity': 0.6},
+                    'label': {
+                        'show': True,
+                        'position': 'insideLeft',
+                        'distance': 10,
+                        'formatter': f'🏭 {station}',
+                        'color': '#475569',
+                        'fontSize': 13,
+                        'fontWeight': 'bold'
+                    }
                 },
-                'z': 1
-            })
+                {
+                    'yAxis': station_y_max[station]
+                }
+            ])
 
-        # 构建节点：用 graphic 绘制圆角矩形 + 文字（像素坐标）
-        # 同时构建 scatter 数据（数据坐标，用于点击交互与 tooltip）
         graphic_nodes = []
         graph_nodes = []
         for nid, node in calculator.nodes.items():
             is_critical = nid in path_set
             s = node_times[nid]['start']
             e = node_times[nid]['end']
-            dx, dy = pos[nid]  # 数据坐标
+            dx, dy = pos[nid]
+            
             fill = '#ef4444' if is_critical else '#3b82f6'
             border = '#dc2626' if is_critical else '#2563eb'
 
-            # 像素坐标
-            px = to_px_x(dx)
-            py = to_px_y(dy)
-            half_w_px = node_w_data / (x_max - x_min) * (chart_w - grid_left - grid_right) / 2
-            half_h_px = node_h_data / (y_max - y_min) * (chart_h - grid_top - grid_bottom) / 2
+            # 根据固定的图表分辨率精确计算节点中心的像素坐标 (X, Y)
+            px = grid_left + (dx - x_min) / (x_max - x_min) * (chart_w - grid_left - grid_right)
+            py = grid_top + (dy - y_min) / (y_max - y_min) * (chart_h - grid_top - grid_bottom)
 
-            # 圆角矩形背景（graphic，像素坐标）
+            # 圆角矩形背景（通过 ECharts graphic 绘制像素级圆角，r: 8 保证是真正标准的圆角矩形）
             graphic_nodes.append({
                 'type': 'rect',
-                'left': px - half_w_px,
-                'top': py - half_h_px,
-                'shape': {'width': half_w_px * 2, 'height': half_h_px * 2, 'r': 8},
-                'style': {'fill': fill, 'stroke': border, 'lineWidth': 2,
-                          'shadowBlur': 6, 'shadowColor': 'rgba(0,0,0,0.15)', 'shadowOffsetY': 2},
-                'z2': 10
+                'left': px - 55,
+                'top': py - 21,
+                'shape': {'width': 110, 'height': 42, 'r': 8},
+                'style': {
+                    'fill': fill,
+                    'stroke': border,
+                    'lineWidth': 2,
+                    'shadowBlur': 4,
+                    'shadowColor': 'rgba(0,0,0,0.1)',
+                    'shadowOffsetY': 2
+                },
+                'z': 10
             })
-            # 动作名称
+            # 动作名称文字标签 (graphic)
             graphic_nodes.append({
                 'type': 'text',
-                'left': px,
-                'top': py - 7,
-                'style': {'text': node.name, 'textAlign': 'center', 'textVerticalAlign': 'middle',
-                          'fill': '#fff', 'fontSize': 12, 'fontWeight': 'bold'},
-                'z2': 11
+                'x': px,
+                'y': py - 8,
+                'style': {
+                    'text': node.name,
+                    'textAlign': 'center',
+                    'textVerticalAlign': 'middle',
+                    'fill': '#fff',
+                    'fontSize': 12,
+                    'fontWeight': 'bold'
+                },
+                'z': 11
             })
-            # 耗时
+            # 耗时数值标签 (graphic)
             graphic_nodes.append({
                 'type': 'text',
-                'left': px,
-                'top': py + 11,
-                'style': {'text': f"{node.duration:.0f}ms", 'textAlign': 'center', 'textVerticalAlign': 'middle',
-                          'fill': '#fff', 'fontSize': 11},
-                'z2': 11
+                'x': px,
+                'y': py + 10,
+                'style': {
+                    'text': f"{node.duration:.0f}ms",
+                    'textAlign': 'center',
+                    'textVerticalAlign': 'middle',
+                    'fill': '#fff',
+                    'fontSize': 11
+                },
+                'z': 11
             })
 
-            # scatter 数据（数据坐标，用于点击交互与 tooltip）
+            # 透明的 scatter 节点，专门用来捕捉 Tooltip 浮层和 Click 事件
             graph_nodes.append({
                 'name': f"{node.name}({nid})",
                 'value': [dx, dy],
-                'symbolSize': [node_w_data, node_h_data],
                 'symbol': 'rect',
-                'itemStyle': {'color': 'rgba(0,0,0,0)', 'borderWidth': 0},
-                'label': {'show': False},
-                'emphasis': {'itemStyle': {'color': 'rgba(0,0,0,0.05)', 'borderColor': '#334155', 'borderWidth': 1, 'borderRadius': 8}},
-                'tooltip': f"<b>{node.name}</b> (ID: {nid})<br/>工位: {node.station}<br/>耗时: {node.duration:.1f} ms<br/>开始: {s:.1f} ms<br/>结束: {e:.1f} ms"
+                'symbolSize': [110, 42],
+                'itemStyle': {
+                    'color': 'rgba(0,0,0,0)',
+                    'borderColor': 'rgba(0,0,0,0)',
+                    'borderWidth': 0
+                },
+                'label': {
+                    'show': False
+                },
+                'tooltip': {
+                    'formatter': f"<b>{node.name}</b> (ID: {nid})<br/>工位: {node.station}<br/>耗时: {node.duration:.1f} ms<br/>开始: {s:.1f} ms<br/>结束: {e:.1f} ms"
+                }
             })
 
-        # 构建正交连线 (line 系列，数据坐标)
-        # FS: 从前置右侧(结束)连向后置左侧(开始)
-        # SS: 从前置左侧(开始)连向后置左侧(开始)
         edge_series = []
         for dep in calculator.dependencies:
-            pred = calculator.nodes.get(dep.predecessor_id)
-            succ = calculator.nodes.get(dep.successor_id)
-            if not pred or not succ:
-                continue
-            sx, sy = pos[dep.predecessor_id]
-            tx, ty = pos[dep.successor_id]
             is_fs = dep.dep_type == DependencyType.FS
-
-            if is_fs:
-                sx += node_w_data / 2   # 前置右侧（结束端）
-                tx -= node_w_data / 2   # 后置左侧（开始端）
-                mid_x = (sx + tx) / 2
-                path_data = [[sx, sy], [mid_x, sy], [mid_x, ty], [tx, ty]]
-            else:
-                # SS: 两侧都取左侧（开始端）
-                sx -= node_w_data / 2
-                tx -= node_w_data / 2
-                if abs(sx - tx) < 1:
-                    # 同深度：垂直直线
-                    path_data = [[sx, sy], [tx, ty]]
-                else:
-                    # 不同深度：先左出，再垂直，再右进
-                    pad = 15
-                    mid_x = min(sx, tx) - pad
-                    path_data = [[sx, sy], [mid_x, sy], [mid_x, ty], [tx, ty]]
-
             label_text = f"{'FS' if is_fs else 'SS'}"
             if dep.delay > 0:
                 label_text += f" +{dep.delay:.0f}ms"
-
+                
+            pred_node = calculator.nodes.get(dep.predecessor_id)
+            succ_node = calculator.nodes.get(dep.successor_id)
+            if not pred_node or not succ_node:
+                continue
+                
+            sx, sy = pos[dep.predecessor_id]
+            tx, ty = pos[dep.successor_id]
+            
+            # 精确计算连线的起点和终点，使之落在节点的外边缘
+            if is_fs:
+                # FS: 从前置右侧连向后置左侧
+                line_sx = sx + node_w_data / 2
+                line_tx = tx - node_w_data / 2
+                mid_x = (line_sx + line_tx) / 2
+                
+                # 只有中间段的那个点才展示 label，防止在每个折线顶点都重复堆叠渲染 label
+                path_data = [
+                    [line_sx, sy],
+                    [mid_x, sy],
+                    {
+                        'value': [mid_x, (sy + ty) / 2],
+                        'label': {
+                            'show': True,
+                            'formatter': label_text,
+                            'position': 'middle',
+                            'fontSize': 9,
+                            'color': '#64748b',
+                            'backgroundColor': '#fff',
+                            'padding': [1, 3]
+                        }
+                    },
+                    [mid_x, ty],
+                    [line_tx, ty]
+                ]
+            else:
+                # SS: 从前置左侧连向后置左侧
+                line_sx = sx - node_w_data / 2
+                line_tx = tx - node_w_data / 2
+                if abs(line_sx - line_tx) < 1:
+                    path_data = [
+                        [line_sx, sy],
+                        {
+                            'value': [line_sx, (sy + ty) / 2],
+                            'label': {
+                                'show': True,
+                                'formatter': label_text,
+                                'position': 'middle',
+                                'fontSize': 9,
+                                'color': '#64748b',
+                                'backgroundColor': '#fff',
+                                'padding': [1, 3]
+                            }
+                        },
+                        [line_tx, ty]
+                    ]
+                else:
+                    pad = 15
+                    mid_x = min(line_sx, line_tx) - pad
+                    path_data = [
+                        [line_sx, sy],
+                        [mid_x, sy],
+                        {
+                            'value': [mid_x, (sy + ty) / 2],
+                            'label': {
+                                'show': True,
+                                'formatter': label_text,
+                                'position': 'middle',
+                                'fontSize': 9,
+                                'color': '#64748b',
+                                'backgroundColor': '#fff',
+                                'padding': [1, 3]
+                            }
+                        },
+                        [mid_x, ty],
+                        [line_tx, ty]
+                    ]
+                    
             edge_series.append({
                 'type': 'line',
                 'data': path_data,
@@ -485,33 +572,37 @@ def refresh_ui():
                     'width': 2
                 },
                 'label': {
-                    'show': True,
-                    'formatter': label_text,
-                    'position': 'middle',
-                    'fontSize': 9,
-                    'color': '#64748b',
-                    'backgroundColor': '#fff',
-                    'padding': [1, 3]
+                    'show': False
                 },
                 'emphasis': {'disabled': True},
                 'tooltip': {'show': False},
                 'z': 1
             })
 
-        scatter_series = [{
+        scatter_series = {
             'type': 'scatter',
             'data': graph_nodes,
             'z': 2,
-            'silent': False
-        }]
+            'silent': False,
+            'markArea': {
+                'silent': True,
+                'data': mark_area_data
+            }
+        }
 
-        # 更新图表选项（轴范围 + graphic + series）
+        # 移除了 ECharts 内置的 dataZoom，彻底禁用缩放行为。
+        # 当元素过多时，依靠外层的 NiceGUI ui.scroll_area 滚动条进行原生的上下左右平移。
+        if 'dataZoom' in graph_chart.options:
+            del graph_chart.options['dataZoom']
+
+        # 确保Y轴自上而下，同时清理遗留的graphic
+        graph_chart.options['yAxis']['inverse'] = True
         graph_chart.options['xAxis']['min'] = x_min
         graph_chart.options['xAxis']['max'] = x_max
         graph_chart.options['yAxis']['min'] = y_min
         graph_chart.options['yAxis']['max'] = y_max
-        graph_chart.options['graphic'] = graphic_elements + graphic_nodes
-        graph_chart.options['series'] = edge_series + scatter_series
+        graph_chart.options['graphic'] = graphic_nodes
+        graph_chart.options['series'] = edge_series + [scatter_series]
         graph_chart.update()
 
     except ValueError as e:
@@ -718,7 +809,7 @@ with ui.row().classes('w-full p-6 justify-between items-stretch gap-6 no-wrap'):
                 'tooltip': {
                     'trigger': 'axis',
                     'axisPointer': {'type': 'shadow'},
-                    'formatter': '{b}<br/>开始时间: {c0} ms<br/>动作耗时: {c1} ms'
+                    'formatter': '{b}<br/>基准开始: {c0} ms<br/>前置延时: {c1} ms<br/>动作耗时: {c2} ms'
                 },
                 'grid': {
                     'left': '3%',
@@ -756,6 +847,26 @@ with ui.row().classes('w-full p-6 justify-between items-stretch gap-6 no-wrap'):
                                 'borderColor': 'rgba(0,0,0,0)',
                                 'color': 'rgba(0,0,0,0)'
                             }
+                        },
+                        'data': []
+                    },
+                    {
+                        'name': '延迟时间',
+                        'type': 'bar',
+                        'stack': 'Total',
+                        'itemStyle': {
+                            'color': 'rgba(244, 63, 94, 0.08)',  # 淡粉红色填充底纹
+                            'borderColor': '#f43f5e',           # 玫瑰红边框
+                            'borderWidth': 1.5,
+                            'borderType': 'dashed',             # 虚线边框类型
+                            'borderRadius': 4
+                        },
+                        'label': {
+                            'show': True,
+                            'position': 'inside',
+                            'formatter': '{c} ms',
+                            'fontSize': 9,
+                            'color': '#e11d48'
                         },
                         'data': []
                     },
@@ -811,7 +922,8 @@ with ui.row().classes('w-full p-6 justify-between items-stretch gap-6 no-wrap'):
                 'animationDuration': 200,
                 'series': []
             }
-            graph_chart = ui.echart(options=graph_options).classes('w-full h-96')
+            with ui.scroll_area().classes('w-full h-[450px]') as graph_scroll:
+                graph_chart = ui.echart(options=graph_options).style('width: 100%; height: 400px;')
 
             def handle_graph_click(e):
                 args = e.args
