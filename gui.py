@@ -311,29 +311,60 @@ def refresh_ui():
                 ]
             else:
                 # 跨行：避开连线本身连接的两个矩形内部及短边边缘
-                dx = 15  # 安全偏置量
+                dx = 20  # 安全偏置量
                 
-                # 如果 X 轴上连接间隔足够，则采用更简约的单垂直段
+                # 如果 X 轴上连接间隔足够，则采用单个垂直段
                 if sx - px >= 2.0 * dx:
                     # 1. 采用单个垂直段（2个圆角过渡）
                     candidate_x = (px + sx) / 2.0
                     my = (py + sy) / 2.0
+                    
+                    # 动态计算圆角半径，防止折弯重叠
+                    r_y = min(0.15, abs(py - sy) * 0.2)
+                    r_x = min(8.0, abs(px - candidate_x) * 0.4)
+                    
+                    dy_sign = 1.0 if sy > py else -1.0
+                    dx_sign1 = 1.0 if candidate_x > px else -1.0
+                    dx_sign2 = 1.0 if sx > candidate_x else -1.0
+                    
+                    pt_c1_start = [candidate_x - dx_sign1 * r_x, py]
+                    pt_c1_mid = [candidate_x, py]
+                    pt_c1_end = [candidate_x, py + dy_sign * r_y]
+                    
+                    pt_c2_start = [candidate_x, sy - dy_sign * r_y]
+                    pt_c2_mid = [candidate_x, sy]
+                    pt_c2_end = [candidate_x + dx_sign2 * r_x, sy]
+                    
                     bezier_pts = []
-                    # Corner 1: 从 [px, py] -> [candidate_x, py] -> [candidate_x, my]
-                    for step in range(10):
-                        t = step / 9.0
-                        bx = (1-t)**2 * px + 2*(1-t)*t * candidate_x + t**2 * candidate_x
-                        by = (1-t)**2 * py + 2*(1-t)*t * py + t**2 * my
+                    
+                    # 起始水平段
+                    bezier_pts.append([px, py])
+                    if abs(px - pt_c1_start[0]) > 1e-3:
+                        bezier_pts.append(pt_c1_start)
+                        
+                    # Corner 1
+                    for step in range(1, 5):
+                        t = step / 4.0
+                        bx = (1-t)**2 * pt_c1_start[0] + 2*(1-t)*t * pt_c1_mid[0] + t**2 * pt_c1_end[0]
+                        by = (1-t)**2 * pt_c1_start[1] + 2*(1-t)*t * pt_c1_mid[1] + t**2 * pt_c1_end[1]
                         bezier_pts.append([bx, by])
-                    # Corner 2: 从 [candidate_x, my] -> [candidate_x, sy] -> [sx, sy]
-                    for step in range(1, 11):
-                        t = step / 10.0
-                        bx = (1-t)**2 * candidate_x + 2*(1-t)*t * candidate_x + t**2 * sx
-                        by = (1-t)**2 * my + 2*(1-t)*t * sy + t**2 * sy
+                        
+                    # 中间垂直段
+                    if abs(pt_c1_end[1] - pt_c2_start[1]) > 1e-3:
+                        bezier_pts.append([candidate_x, (pt_c1_end[1] + pt_c2_start[1]) / 2.0])
+                        
+                    # Corner 2
+                    for step in range(1, 5):
+                        t = step / 4.0
+                        bx = (1-t)**2 * pt_c2_start[0] + 2*(1-t)*t * pt_c2_mid[0] + t**2 * pt_c2_end[0]
+                        by = (1-t)**2 * pt_c2_start[1] + 2*(1-t)*t * pt_c2_mid[1] + t**2 * pt_c2_end[1]
                         bezier_pts.append([bx, by])
+                        
+                    # 结束水平段
+                    if abs(pt_c2_end[0] - sx) > 1e-3:
+                        bezier_pts.append([sx, sy])
                 else:
                     # 2. 采用双垂直段绕行（3段水平，2段垂直，4个圆角过渡）
-                    # 此时 X1 = px + dx (向右绕过前置矩形), X2 = sx - dx (从左侧滑入后置矩形)
                     if sy > py:
                         my = (py + sy) // 2 + 0.5
                     else:
@@ -342,43 +373,88 @@ def refresh_ui():
                     X1 = px + dx
                     X2 = sx - dx
                     
-                    # 兜底确保 X 坐标合理
                     X1 = max(10.0, X1)
                     X2 = max(10.0, X2)
                     
-                    my1 = (py + my) / 2.0
-                    mx = (X1 + X2) / 2.0
-                    my2 = (my + sy) / 2.0
+                    # 动态计算圆角半径，防止折弯重叠
+                    r_y = min(0.15, abs(py - my) * 0.2)
+                    r_x = min(8.0, abs(X1 - X2) * 0.4)
+                    
+                    dy_sign = 1.0 if sy > py else -1.0
+                    dx_sign_pred = 1.0 if X1 > px else -1.0
+                    dx_sign_mid = 1.0 if X2 > X1 else -1.0
+                    dx_sign_succ = 1.0 if sx > X2 else -1.0
+                    
+                    # Corner 1: [px, py] -> [X1, py] -> [X1, py + dy_sign * r_y]
+                    pt_c1_start = [X1 - dx_sign_pred * r_x, py]
+                    pt_c1_mid = [X1, py]
+                    pt_c1_end = [X1, py + dy_sign * r_y]
+                    
+                    # Corner 2: [X1, my - dy_sign * r_y] -> [X1, my] -> [X1 + dx_sign_mid * r_x, my]
+                    pt_c2_start = [X1, my - dy_sign * r_y]
+                    pt_c2_mid = [X1, my]
+                    pt_c2_end = [X1 + dx_sign_mid * r_x, my]
+                    
+                    # Corner 3: [X2 - dx_sign_mid * r_x, my] -> [X2, my] -> [X2, my + dy_sign * r_y]
+                    pt_c3_start = [X2 - dx_sign_mid * r_x, my]
+                    pt_c3_mid = [X2, my]
+                    pt_c3_end = [X2, my + dy_sign * r_y]
+                    
+                    # Corner 4: [X2, sy - dy_sign * r_y] -> [X2, sy] -> [X2 + dx_sign_succ * r_x, sy]
+                    pt_c4_start = [X2, sy - dy_sign * r_y]
+                    pt_c4_mid = [X2, sy]
+                    pt_c4_end = [X2 + dx_sign_succ * r_x, sy]
                     
                     bezier_pts = []
                     
-                    # Corner 1: [px, py] -> [X1, py] -> [X1, my1]
-                    for step in range(6):
-                        t = step / 5.0
-                        bx = (1-t)**2 * px + 2*(1-t)*t * X1 + t**2 * X1
-                        by = (1-t)**2 * py + 2*(1-t)*t * py + t**2 * my1
+                    # 起始水平段
+                    bezier_pts.append([px, py])
+                    if abs(px - pt_c1_start[0]) > 1e-3:
+                        bezier_pts.append(pt_c1_start)
+                        
+                    # Corner 1
+                    for step in range(1, 5):
+                        t = step / 4.0
+                        bx = (1-t)**2 * pt_c1_start[0] + 2*(1-t)*t * pt_c1_mid[0] + t**2 * pt_c1_end[0]
+                        by = (1-t)**2 * pt_c1_start[1] + 2*(1-t)*t * pt_c1_mid[1] + t**2 * pt_c1_end[1]
                         bezier_pts.append([bx, by])
                         
-                    # Corner 2: [X1, my1] -> [X1, my] -> [mx, my]
-                    for step in range(1, 6):
-                        t = step / 5.0
-                        bx = (1-t)**2 * X1 + 2*(1-t)*t * X1 + t**2 * mx
-                        by = (1-t)**2 * my1 + 2*(1-t)*t * my + t**2 * my
+                    # 第一垂直段
+                    if abs(pt_c1_end[1] - pt_c2_start[1]) > 1e-3:
+                        bezier_pts.append([X1, (pt_c1_end[1] + pt_c2_start[1]) / 2.0])
+                        
+                    # Corner 2
+                    for step in range(1, 5):
+                        t = step / 4.0
+                        bx = (1-t)**2 * pt_c2_start[0] + 2*(1-t)*t * pt_c2_mid[0] + t**2 * pt_c2_end[0]
+                        by = (1-t)**2 * pt_c2_start[1] + 2*(1-t)*t * pt_c2_mid[1] + t**2 * pt_c2_end[1]
                         bezier_pts.append([bx, by])
                         
-                    # Corner 3: [mx, my] -> [X2, my] -> [X2, my2]
-                    for step in range(1, 6):
-                        t = step / 5.0
-                        bx = (1-t)**2 * mx + 2*(1-t)*t * X2 + t**2 * X2
-                        by = (1-t)**2 * my + 2*(1-t)*t * my + t**2 * my2
+                    # 中间水平段
+                    if abs(pt_c2_end[0] - pt_c3_start[0]) > 1e-3:
+                        bezier_pts.append([(pt_c2_end[0] + pt_c3_start[0]) / 2.0, my])
+                        
+                    # Corner 3
+                    for step in range(1, 5):
+                        t = step / 4.0
+                        bx = (1-t)**2 * pt_c3_start[0] + 2*(1-t)*t * pt_c3_mid[0] + t**2 * pt_c3_end[0]
+                        by = (1-t)**2 * pt_c3_start[1] + 2*(1-t)*t * pt_c3_mid[1] + t**2 * pt_c3_end[1]
                         bezier_pts.append([bx, by])
                         
-                    # Corner 4: [X2, my2] -> [X2, sy] -> [sx, sy]
-                    for step in range(1, 6):
-                        t = step / 5.0
-                        bx = (1-t)**2 * X2 + 2*(1-t)*t * X2 + t**2 * sx
-                        by = (1-t)**2 * my2 + 2*(1-t)*t * sy + t**2 * sy
+                    # 第二垂直段
+                    if abs(pt_c3_end[1] - pt_c4_start[1]) > 1e-3:
+                        bezier_pts.append([X2, (pt_c3_end[1] + pt_c4_start[1]) / 2.0])
+                        
+                    # Corner 4
+                    for step in range(1, 5):
+                        t = step / 4.0
+                        bx = (1-t)**2 * pt_c4_start[0] + 2*(1-t)*t * pt_c4_mid[0] + t**2 * pt_c4_end[0]
+                        by = (1-t)**2 * pt_c4_start[1] + 2*(1-t)*t * pt_c4_mid[1] + t**2 * pt_c4_end[1]
                         bezier_pts.append([bx, by])
+                        
+                    # 结束水平段
+                    if abs(pt_c4_end[0] - sx) > 1e-3:
+                        bezier_pts.append([sx, sy])
                         
                 # 终点配置为箭头
                 bezier_pts[-1] = {
